@@ -19,44 +19,15 @@ import httpx
 import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("Gateway")
+logger = logging.getLogger("X4G-Gateway")
 
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
-app = FastAPI(title="Gateway", docs_url=None, redoc_url=None)
-
-# ── Persistence ───────────────────────────────────────────────────────────────
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
-DATA_FILE = DATA_DIR / "gateway_state.json"
-SECRET_FILE = DATA_DIR / "gateway_secret.key"
-SAVE_LOCK = asyncio.Lock()
-
-def _load_or_create_secret() -> str:
-    """SECRET_KEY را روی دیسک ذخیره و ثابت نگه می‌دارد.
-    قبلاً وقتی متغیر محیطی SECRET_KEY تنظیم نشده بود، با هر ری‌استارت سرویس
-    (که روی Railway هر چند ساعت یک‌بار اتفاق می‌افتد) یک مقدار تصادفی جدید
-    ساخته می‌شد. چون هش پسورد بر پایه‌ی همین secret ساخته می‌شود، تغییر آن
-    باعث می‌شد پسورد درست هم دیگر قبول نشود. حالا secret یک‌بار ساخته و در
-    فایل ذخیره می‌شود و در ری‌استارت‌های بعدی همان مقدار خوانده می‌شود."""
-    env_secret = os.environ.get("SECRET_KEY")
-    if env_secret:
-        return env_secret
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        if SECRET_FILE.exists():
-            existing = SECRET_FILE.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing
-        new_secret = secrets.token_urlsafe(32)
-        SECRET_FILE.write_text(new_secret, encoding="utf-8")
-        return new_secret
-    except Exception as e:
-        logger.warning(f"Could not persist SECRET_KEY, sessions/password may reset on restart: {e}")
-        return secrets.token_urlsafe(32)
+app = FastAPI(title="X4G Gateway", docs_url=None, redoc_url=None)
 
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
-    "secret": _load_or_create_secret(),
+    "secret": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
     "host": os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"),
 }
 
@@ -67,6 +38,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Persistence ───────────────────────────────────────────────────────────────
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+DATA_FILE = DATA_DIR / "x4g_state.json"
+SAVE_LOCK = asyncio.Lock()
 
 async def load_state():
     global LINKS, AUTH, SUBS
@@ -122,23 +98,6 @@ SUBS_LOCK = asyncio.Lock()
 PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one")
 DEFAULT_PROTOCOL = "vless-ws"
 
-# Fingerprint (uTLS) های قابل انتخاب برای هر کانفیگ
-FINGERPRINTS = ("chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized")
-DEFAULT_FINGERPRINT = "chrome"
-
-# پیش‌فرض ALPN بر اساس نوع ترابرد (اگر کاربر مقدار دستی نده)
-DEFAULT_ALPN_BY_PROTOCOL = {
-    "vless-ws": "http/1.1",
-    "xhttp-packet-up": "h2,http/1.1",
-    "xhttp-stream-up": "h2,http/1.1",
-    "xhttp-stream-one": "h2,http/1.1",
-}
-DEFAULT_PORT = 443
-MIN_PORT, MAX_PORT = 1, 65535
-
-# محدودیت سرعت (0 = نامحدود). واحد ذخیره‌سازی داخلی همیشه بایت‌بر‌ثانیه است.
-DEFAULT_SPEED_LIMIT = 0
-
 def log_activity(kind: str, message: str, level: str = "info"):
     """ثبت یک رخداد در لاگ فعالیت‌ها (ساخت/حذف/ویرایش کانفیگ، ورود، و...)."""
     activity_logs.append({
@@ -149,13 +108,13 @@ def log_activity(kind: str, message: str, level: str = "info"):
     })
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
-SESSION_COOKIE = "gateway_session"
-SESSION_TTL = 60 * 60 * 24 * 365
+SESSION_COOKIE = "x4g_session"
+SESSION_TTL = 60 * 60 * 24 * 7
 
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "admin"))}
+AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "123456"))}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
@@ -199,29 +158,17 @@ async def startup():
         limits=limits, timeout=timeout, follow_redirects=True,
     )
     await load_state()
-    await _tg_start_bot()
     log_activity("system", "سرور راه‌اندازی شد", "ok")
-    logger.info(f"Gateway v11 started on port {CONFIG['port']}")
+    logger.info(f"X4G Gateway v9.1 started on port {CONFIG['port']}")
 
 @app.on_event("shutdown")
 async def shutdown():
     await save_state()
-    await _tg_stop_bot()
     if http_client:
         await http_client.aclose()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def get_host(request: Request | None = None) -> str:
-    """آدرس دامنه رو ترجیحاً از خودِ درخواست HTTP می‌گیره (هدر Host/X-Forwarded-Host)
-    چون این همیشه دقیقاً همون دامنه‌ایه که کاربر واقعاً بهش وصل شده. متغیر محیطی
-    RAILWAY_PUBLIC_DOMAIN فقط به‌عنوان fallback استفاده می‌شه، چون گاهی موقع بالا اومدن
-    کانتینر هنوز مقداردهی نشده و باعث می‌شد لینک‌ها گاهی با "localhost" ساخته بشن."""
-    if request is not None:
-        h = request.headers.get("x-forwarded-host") or request.headers.get("host")
-        if h:
-            h = h.split(":")[0]
-            CONFIG["host"] = h  # کش آخرین دامنه‌ی واقعی دیده‌شده، برای جاهایی که request نداریم (مثل ربات تلگرام)
-            return h
+def get_host() -> str:
     return os.environ.get("RAILWAY_PUBLIC_DOMAIN", CONFIG["host"])
 
 def generate_uuid() -> str:
@@ -231,25 +178,8 @@ def generate_uuid() -> str:
 def now_ir() -> datetime:
     return datetime.now(IRAN_TZ)
 
-def generate_vless_link(
-    uuid: str,
-    host: str,
-    remark: str = "Gateway",
-    protocol: str = DEFAULT_PROTOCOL,
-    fingerprint: str | None = None,
-    alpn: str | None = None,
-    port: int | None = None,
-) -> str:
-    """می‌سازد VLESS share-link متناسب با پروتکل انتخاب‌شده (WS کلاسیک یا یکی از مدهای XHTTP).
-    fingerprint / alpn / port در صورت ندادن، از پیش‌فرض‌های خود پروتکل استفاده می‌شوند."""
-    fp = (fingerprint or DEFAULT_FINGERPRINT).strip() or DEFAULT_FINGERPRINT
-    if fp not in FINGERPRINTS:
-        fp = DEFAULT_FINGERPRINT
-    alpn_val = (alpn or "").strip() or DEFAULT_ALPN_BY_PROTOCOL.get(protocol, "http/1.1")
-    port_val = port or DEFAULT_PORT
-    if not (MIN_PORT <= port_val <= MAX_PORT):
-        port_val = DEFAULT_PORT
-
+def generate_vless_link(uuid: str, host: str, remark: str = "X4G", protocol: str = DEFAULT_PROTOCOL) -> str:
+    """می‌سازد VLESS share-link متناسب با پروتکل انتخاب‌شده (WS کلاسیک یا یکی از مدهای XHTTP)."""
     if protocol == "vless-ws":
         path = f"/ws/{uuid}"
         params = {
@@ -259,8 +189,8 @@ def generate_vless_link(
             "host": host,
             "path": path,
             "sni": host,
-            "fp": fp,
-            "alpn": alpn_val,
+            "fp": "chrome",
+            "alpn": "http/1.1",
         }
     else:
         # xhttp-packet-up / xhttp-stream-up / xhttp-stream-one
@@ -274,23 +204,11 @@ def generate_vless_link(
             "host": host,
             "path": path,
             "sni": host,
-            "fp": fp,
-            "alpn": alpn_val,
+            "fp": "chrome",
+            "alpn": "h2,http/1.1",
         }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    return f"vless://{uuid}@{host}:{port_val}?{query}#{quote(remark)}"
-
-def vless_link_for_link(link: dict, uid: str, host: str) -> str:
-    """generate_vless_link رو با تنظیمات دستی همون کانفیگ (fingerprint/alpn/port) صدا می‌زنه."""
-    proto = link.get("protocol", DEFAULT_PROTOCOL)
-    return generate_vless_link(
-        uid, host,
-        remark=f"Gateway-{link.get('label','')}",
-        protocol=proto,
-        fingerprint=link.get("fingerprint"),
-        alpn=link.get("alpn"),
-        port=link.get("port"),
-    )
+    return f"vless://{uuid}@{host}:443?{query}#{quote(remark)}"
 
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
@@ -302,20 +220,6 @@ def parse_size_to_bytes(value: float, unit: str) -> int:
     if unit == "GB": return int(value * 1024 ** 3)
     if unit == "MB": return int(value * 1024 ** 2)
     if unit == "KB": return int(value * 1024)
-    return int(value)
-
-def parse_speed_to_bytes(value: float, unit: str) -> int:
-    """محدودیت سرعت رو به بایت‌بر‌ثانیه تبدیل می‌کنه.
-    واحدهای پشتیبانی‌شده: MBIT (مگابیت‌بر‌ثانیه، رایج‌ترین)، KB (کیلوبایت‌بر‌ثانیه)، MB (مگابایت‌بر‌ثانیه)."""
-    if value <= 0:
-        return 0
-    unit = (unit or "MBIT").upper()
-    if unit == "MBIT":
-        return int(value * 1024 * 1024 / 8)
-    if unit == "KB":
-        return int(value * 1024)
-    if unit == "MB":
-        return int(value * 1024 * 1024)
     return int(value)
 
 def is_link_expired(link: dict) -> bool:
@@ -344,24 +248,6 @@ def fmt_bytes(b: int) -> str:
     if b < 1024**2: return f"{b/1024:.1f} KB"
     if b < 1024**3: return f"{b/1024**2:.2f} MB"
     return f"{b/1024**3:.2f} GB"
-
-def unique_ips_for_uuid(uuid: str) -> set:
-    """آی‌پی‌های یکتای همین لحظه متصل به یک UUID خاص (بر اساس dict اتصالات زنده)."""
-    return {c.get("ip") for c in connections.values() if c.get("uuid") == uuid and c.get("ip")}
-
-def is_ip_allowed(link: dict | None, uuid: str, ip: str) -> bool:
-    """محدودیت تعداد آی‌پی/کاربر هم‌زمان برای هر کانفیگ. ip_limit=0 یعنی نامحدود.
-    اگر همین آی‌پی از قبل روی این کانفیگ سشن باز داشته باشه، همیشه مجازه (برای چند اتصال
-    هم‌زمان از یک دستگاه/مرورگر مشکلی پیش نمیاد)."""
-    if link is None:
-        return False
-    limit = int(link.get("ip_limit", 0) or 0)
-    if limit <= 0:
-        return True
-    ips = unique_ips_for_uuid(uuid)
-    if ip in ips:
-        return True
-    return len(ips) < limit
 
 def client_ip(request: Request) -> str:
     """آی‌پی واقعی کلاینت رو با احتساب هدرهای پراکسی (Railway/Cloudflare) برمی‌گردونه."""
@@ -396,11 +282,6 @@ async def ensure_default_link():
                     "is_default": True,
                     "sub_id": None,
                     "protocol": DEFAULT_PROTOCOL,
-                    "fingerprint": DEFAULT_FINGERPRINT,
-                    "alpn": "",
-                    "port": DEFAULT_PORT,
-                    "ip_limit": 0,
-                    "speed_limit_bytes": DEFAULT_SPEED_LIMIT,
                 }
                 asyncio.create_task(save_state())
         _default_link_created = True
@@ -408,7 +289,7 @@ async def ensure_default_link():
 # ── Basic endpoints ───────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "Gateway", "version": "11", "status": "active", "channel": ""}
+    return {"service": "X4G Gateway", "version": "9.1", "status": "active", "channel": "https://t.me/Farajian2004f"}
 
 @app.get("/health")
 async def health():
@@ -416,25 +297,26 @@ async def health():
 
 # ── Subscription (single link) ────────────────────────────────────────────────
 @app.get("/sub/{uuid}")
-async def subscription_single(uuid: str, request: Request):
+async def subscription_single(uuid: str):
     import base64
     async with LINKS_LOCK:
         link = LINKS.get(uuid)
     if not link or not is_link_allowed(link):
         raise HTTPException(status_code=404, detail="not found or inactive")
-    host = get_host(request)
-    vless = vless_link_for_link(link, uuid, host)
+    host = get_host()
+    proto = link.get("protocol", DEFAULT_PROTOCOL)
+    vless = generate_vless_link(uuid, host, remark=f"X4G-{link['label']}", protocol=proto)
     content = base64.b64encode(vless.encode()).decode()
     return Response(content=content, media_type="text/plain",
-                    headers={"profile-title": quote(link["label"]), "support-url": ""})
+                    headers={"profile-title": quote(link["label"]), "support-url": "https://t.me/Farajian2004f"})
 
 @app.get("/sub-all")
-async def subscription_all(request: Request, _=Depends(require_auth)):
+async def subscription_all(_=Depends(require_auth)):
     import base64
-    host = get_host(request)
+    host = get_host()
     async with LINKS_LOCK:
         lines = [
-            vless_link_for_link(d, uid, host)
+            generate_vless_link(uid, host, remark=f"X4G-{d['label']}", protocol=d.get("protocol", DEFAULT_PROTOCOL))
             for uid, d in LINKS.items()
             if is_link_allowed(d)
         ]
@@ -464,7 +346,7 @@ async def create_sub(request: Request, _=Depends(require_auth)):
         }
     asyncio.create_task(save_state())
     log_activity("sub", f"گروه «{name}» ساخته شد", "ok")
-    host = get_host(request)
+    host = get_host()
     return {
         "sub_id": sub_id,
         **SUBS[sub_id],
@@ -473,8 +355,8 @@ async def create_sub(request: Request, _=Depends(require_auth)):
     }
 
 @app.get("/api/subs")
-async def list_subs(request: Request, _=Depends(require_auth)):
-    host = get_host(request)
+async def list_subs(_=Depends(require_auth)):
+    host = get_host()
     async with SUBS_LOCK:
         snap_subs = dict(SUBS)
     async with LINKS_LOCK:
@@ -569,14 +451,14 @@ async def sub_group_subscription(uuid_key: str, request: Request):
         if hash_password(pw) != sub["password_hash"]:
             raise HTTPException(status_code=403, detail="wrong password")
 
-    host = get_host(request)
+    host = get_host()
     link_ids = sub.get("link_ids", [])
     async with LINKS_LOCK:
         lines = []
         for lid in link_ids:
             link = LINKS.get(lid)
             if link and is_link_allowed(link):
-                lines.append(vless_link_for_link(link, lid, host))
+                lines.append(generate_vless_link(lid, host, remark=f"X4G-{link['label']}", protocol=link.get("protocol", DEFAULT_PROTOCOL)))
 
     content = base64.b64encode("\n".join(lines).encode()).decode()
     return Response(
@@ -584,7 +466,7 @@ async def sub_group_subscription(uuid_key: str, request: Request):
         media_type="text/plain",
         headers={
             "profile-title": quote(sub["name"]),
-            "support-url": "",
+            "support-url": "https://t.me/Farajian2004f",
             "profile-update-interval": "12",
         }
     )
@@ -717,192 +599,58 @@ async def get_connections(_=Depends(require_auth)):
         "raw_count": len(connections), # تعداد کل اتصالات باز (بدون گروه‌بندی)
     }
 
-# ── Shared link create/delete helpers (استفاده مشترک API و ربات تلگرام) ───────
-async def make_link(
-    label: str = "لینک جدید",
-    limit_bytes: int = 0,
-    expires_at: str | None = None,
-    note: str = "",
-    sub_id: str | None = None,
-    protocol: str = DEFAULT_PROTOCOL,
-    fingerprint: str = DEFAULT_FINGERPRINT,
-    alpn: str = "",
-    port: int = DEFAULT_PORT,
-    ip_limit: int = 0,
-    speed_limit_bytes: int = 0,
-) -> tuple[str, dict]:
+# ── Link Management ───────────────────────────────────────────────────────────
+@app.post("/api/links")
+async def create_link(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    label = (body.get("label") or "لینک جدید").strip()[:60]
+    lv = float(body.get("limit_value") or 0)
+    lu = body.get("limit_unit") or "GB"
+    limit_bytes = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
+    exp_days = int(body.get("expires_days") or 0)
+    expires_at = (datetime.now() + timedelta(days=exp_days)).isoformat() if exp_days > 0 else None
+    note = (body.get("note") or "").strip()[:200]
+    sub_id = body.get("sub_id") or None
+    protocol = body.get("protocol") or DEFAULT_PROTOCOL
     if protocol not in PROTOCOLS:
         protocol = DEFAULT_PROTOCOL
-    fingerprint = (fingerprint or DEFAULT_FINGERPRINT).strip().lower()
-    if fingerprint not in FINGERPRINTS:
-        fingerprint = DEFAULT_FINGERPRINT
-    if not (MIN_PORT <= port <= MAX_PORT):
-        port = DEFAULT_PORT
+
     uid = generate_uuid()
     async with LINKS_LOCK:
         LINKS[uid] = {
-            "label": (label or "لینک جدید").strip()[:60] or "لینک جدید",
-            "limit_bytes": max(0, limit_bytes),
+            "label": label,
+            "limit_bytes": limit_bytes,
             "used_bytes": 0,
             "created_at": datetime.now().isoformat(),
             "active": True,
             "expires_at": expires_at,
-            "note": (note or "").strip()[:200],
+            "note": note,
             "is_default": False,
             "sub_id": sub_id,
             "protocol": protocol,
-            "fingerprint": fingerprint,
-            "alpn": (alpn or "").strip()[:100],
-            "port": port,
-            "ip_limit": max(0, ip_limit),
-            "speed_limit_bytes": max(0, speed_limit_bytes),
         }
+
     if sub_id:
         async with SUBS_LOCK:
             if sub_id in SUBS:
                 ids = SUBS[sub_id].setdefault("link_ids", [])
                 if uid not in ids:
                     ids.append(uid)
+
     asyncio.create_task(save_state())
-    log_activity("link", f"کانفیگ «{LINKS[uid]['label']}» ساخته شد", "ok")
-    return uid, LINKS[uid]
-
-async def remove_link(uid: str) -> str | None:
-    async with LINKS_LOCK:
-        if uid not in LINKS:
-            return None
-        label = LINKS[uid].get("label", uid)
-        sub_id = LINKS[uid].get("sub_id")
-        del LINKS[uid]
-    if sub_id:
-        async with SUBS_LOCK:
-            if sub_id in SUBS:
-                ids = SUBS[sub_id].get("link_ids", [])
-                if uid in ids:
-                    ids.remove(uid)
-    asyncio.create_task(save_state())
-    log_activity("link", f"کانفیگ «{label}» حذف شد", "err")
-    return label
-
-async def set_link_active(uid: str, active: bool) -> dict | None:
-    async with LINKS_LOCK:
-        if uid not in LINKS:
-            return None
-        LINKS[uid]["active"] = bool(active)
-        label = LINKS[uid]["label"]
-    log_activity("link", f"کانفیگ «{label}» {'فعال' if active else 'غیرفعال'} شد", "ok" if active else "warn")
-    asyncio.create_task(save_state())
-    return LINKS[uid]
-
-# ── Sub-group helpers (reusable — هم API وب هم ربات تلگرام از همین‌ها استفاده می‌کنن) ──
-async def create_sub_group(name: str = "گروه جدید", desc: str = "", password: str = "") -> tuple[str, dict]:
-    name = (name or "گروه جدید").strip()[:60]
-    desc = (desc or "").strip()[:200]
-    password = (password or "").strip()
-    sub_id = generate_uuid()
-    uuid_key = secrets.token_urlsafe(16)
-    async with SUBS_LOCK:
-        SUBS[sub_id] = {
-            "name": name,
-            "desc": desc,
-            "password_hash": hash_password(password) if password else None,
-            "uuid_key": uuid_key,
-            "created_at": datetime.now().isoformat(),
-            "link_ids": [],
-        }
-    asyncio.create_task(save_state())
-    log_activity("sub", f"گروه «{name}» ساخته شد", "ok")
-    return sub_id, SUBS[sub_id]
-
-async def set_link_sub(uid: str, sub_id: str | None) -> bool:
-    """یک کانفیگ رو به یک گروه ساب اضافه/منتقل می‌کنه؛ با sub_id=None از گروه فعلیش خارجش می‌کنه."""
-    async with LINKS_LOCK:
-        if uid not in LINKS:
-            return False
-        old_sub = LINKS[uid].get("sub_id")
-        label = LINKS[uid].get("label", uid)
-    if sub_id is not None:
-        async with SUBS_LOCK:
-            if sub_id not in SUBS:
-                return False
-    async with SUBS_LOCK:
-        if old_sub and old_sub in SUBS:
-            ids = SUBS[old_sub].get("link_ids", [])
-            if uid in ids:
-                ids.remove(uid)
-        if sub_id and sub_id in SUBS:
-            ids = SUBS[sub_id].setdefault("link_ids", [])
-            if uid not in ids:
-                ids.append(uid)
-    async with LINKS_LOCK:
-        if uid in LINKS:
-            LINKS[uid]["sub_id"] = sub_id
-    asyncio.create_task(save_state())
-    log_activity("link", f"کانفیگ «{label}» {'به گروه اضافه شد' if sub_id else 'از گروه خارج شد'}", "info")
-    return True
-
-async def remove_sub_group(sub_id: str) -> str | None:
-    async with SUBS_LOCK:
-        if sub_id not in SUBS:
-            return None
-        name = SUBS[sub_id].get("name", sub_id)
-        del SUBS[sub_id]
-    async with LINKS_LOCK:
-        for link in LINKS.values():
-            if link.get("sub_id") == sub_id:
-                link["sub_id"] = None
-    asyncio.create_task(save_state())
-    log_activity("sub", f"گروه «{name}» حذف شد", "warn")
-    return name
-
-# ── Link Management ───────────────────────────────────────────────────────────
-@app.post("/api/links")
-async def create_link(request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    lv = float(body.get("limit_value") or 0)
-    lu = body.get("limit_unit") or "GB"
-    limit_bytes = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
-    exp_days = int(body.get("expires_days") or 0)
-    expires_at = (datetime.now() + timedelta(days=exp_days)).isoformat() if exp_days > 0 else None
-    try:
-        port = int(body.get("port") or DEFAULT_PORT)
-    except (TypeError, ValueError):
-        port = DEFAULT_PORT
-    try:
-        ip_limit = int(body.get("ip_limit") or 0)
-    except (TypeError, ValueError):
-        ip_limit = 0
-
-    sv = float(body.get("speed_limit_value") or 0)
-    su = body.get("speed_limit_unit") or "MBIT"
-    speed_limit_bytes = 0 if sv <= 0 else parse_speed_to_bytes(sv, su)
-
-    uid, link = await make_link(
-        label=body.get("label") or "لینک جدید",
-        limit_bytes=limit_bytes,
-        expires_at=expires_at,
-        note=body.get("note") or "",
-        sub_id=body.get("sub_id") or None,
-        protocol=body.get("protocol") or DEFAULT_PROTOCOL,
-        fingerprint=body.get("fingerprint") or DEFAULT_FINGERPRINT,
-        alpn=body.get("alpn") or "",
-        port=port,
-        ip_limit=ip_limit,
-        speed_limit_bytes=speed_limit_bytes,
-    )
-
-    host = get_host(request)
+    log_activity("link", f"کانفیگ «{label}» ساخته شد", "ok")
+    host = get_host()
     return {
         "uuid": uid,
-        **link,
+        **LINKS[uid],
         "expired": False,
-        "vless_link": vless_link_for_link(link, uid, host),
+        "vless_link": generate_vless_link(uid, host, remark=f"X4G-{label}", protocol=protocol),
         "sub_url": f"https://{host}/sub/{uid}",
     }
 
 @app.get("/api/links")
-async def list_links(request: Request, _=Depends(require_auth)):
-    host = get_host(request)
+async def list_links(_=Depends(require_auth)):
+    host = get_host()
     async with LINKS_LOCK:
         snap = dict(LINKS)
     result = []
@@ -913,9 +661,8 @@ async def list_links(request: Request, _=Depends(require_auth)):
             **d,
             "protocol": proto,
             "expired": is_link_expired(d),
-            "vless_link": vless_link_for_link(d, uid, host),
+            "vless_link": generate_vless_link(uid, host, remark=f"X4G-{d['label']}", protocol=proto),
             "sub_url": f"https://{host}/sub/{uid}",
-            "connected_ips": len(unique_ips_for_uuid(uid)),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
@@ -946,30 +693,7 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
         if "expires_days" in body:
             ed = int(body["expires_days"] or 0)
             link["expires_at"] = (datetime.now() + timedelta(days=ed)).isoformat() if ed > 0 else None
-        if "fingerprint" in body:
-            fp = str(body.get("fingerprint") or DEFAULT_FINGERPRINT).strip().lower()
-            link["fingerprint"] = fp if fp in FINGERPRINTS else DEFAULT_FINGERPRINT
-        if "alpn" in body:
-            link["alpn"] = str(body.get("alpn") or "").strip()[:100]
-        if "port" in body:
-            try:
-                p = int(body.get("port") or DEFAULT_PORT)
-            except (TypeError, ValueError):
-                p = DEFAULT_PORT
-            link["port"] = p if (MIN_PORT <= p <= MAX_PORT) else DEFAULT_PORT
-        if "ip_limit" in body:
-            try:
-                il = int(body.get("ip_limit") or 0)
-            except (TypeError, ValueError):
-                il = 0
-            link["ip_limit"] = max(0, il)
-        if "speed_limit_value" in body:
-            sv = float(body.get("speed_limit_value") or 0)
-            su = body.get("speed_limit_unit") or "MBIT"
-            link["speed_limit_bytes"] = 0 if sv <= 0 else parse_speed_to_bytes(sv, su)
-            from speed_limit import reset_bucket
-            reset_bucket(uid)
-        if any(k in body for k in ("label", "note", "limit_value", "expires_days", "fingerprint", "alpn", "port", "ip_limit", "speed_limit_value")):
+        if any(k in body for k in ("label", "note", "limit_value", "expires_days")):
             log_activity("link", f"کانفیگ «{link['label']}» ویرایش شد", "info")
         new_sub = body.get("sub_id", "UNCHANGED")
         if new_sub != "UNCHANGED":
@@ -991,9 +715,20 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
 
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
-    label = await remove_link(uid)
-    if label is None:
-        raise HTTPException(status_code=404, detail="link not found")
+    async with LINKS_LOCK:
+        if uid not in LINKS:
+            raise HTTPException(status_code=404, detail="link not found")
+        label = LINKS[uid].get("label", uid)
+        sub_id = LINKS[uid].get("sub_id")
+        del LINKS[uid]
+    if sub_id:
+        async with SUBS_LOCK:
+            if sub_id in SUBS:
+                ids = SUBS[sub_id].get("link_ids", [])
+                if uid in ids:
+                    ids.remove(uid)
+    asyncio.create_task(save_state())
+    log_activity("link", f"کانفیگ «{label}» حذف شد", "err")
     return {"ok": True, "deleted": uid}
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1016,11 +751,6 @@ app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
 # ══════════════════════════════════════════════════════════════════════════════
 from xhttp_siz10 import router as xhttp_router
 app.include_router(xhttp_router)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ربات مدیریت تلگرام (اختیاری — فقط اگه TELEGRAM_BOT_TOKEN ست شده باشه فعال می‌شه)
-# ══════════════════════════════════════════════════════════════════════════════
-from telegram_bot import start_bot as _tg_start_bot, stop_bot as _tg_stop_bot
 
 # ── HTTP Proxy ────────────────────────────────────────────────────────────────
 _HOP = {"connection","keep-alive","proxy-authenticate","proxy-authorization",
@@ -1068,7 +798,7 @@ async def public_sub_data(uuid_key: str, request: Request):
         if hash_password(pw) != sub["password_hash"]:
             return JSONResponse({"locked": True, "name": sub["name"]})
 
-    host = get_host(request)
+    host = get_host()
     link_ids = sub.get("link_ids", [])
     async with LINKS_LOCK:
         snap = dict(LINKS)
@@ -1093,11 +823,9 @@ async def public_sub_data(uuid_key: str, request: Request):
             "limit_bytes": link.get("limit_bytes", 0),
             "limit_fmt": "∞" if link.get("limit_bytes", 0) == 0 else fmt_bytes(link["limit_bytes"]),
             "expires_at": link.get("expires_at"),
-            "vless_link": vless_link_for_link(link, lid, host),
+            "vless_link": generate_vless_link(lid, host, remark=f"X4G-{link['label']}", protocol=proto),
             "sub_url": f"https://{host}/sub/{lid}",
             "connections": conn_count,
-            "ip_limit": link.get("ip_limit", 0),
-            "speed_limit_bytes": link.get("speed_limit_bytes", 0),
         })
 
     total_used = sum(l["used_bytes"] for l in links_out)
