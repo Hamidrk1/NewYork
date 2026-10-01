@@ -5,14 +5,13 @@ import hashlib
 import secrets
 import time
 import aiofiles
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import quote
 from collections import deque, defaultdict
 from pathlib import Path
 
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
-from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, Request, WebSocket
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import httpx
@@ -63,35 +62,6 @@ async def load_state():
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
 
-async def save_state():
-    async with SAVE_LOCK:
-        try:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            data = {
-                "links": dict(LINKS),
-                "subs": dict(SUBS),
-                "password_hash": AUTH.get("password_hash"),
-                "saved_at": datetime.now().isoformat(),
-            }
-            tmp = DATA_FILE.with_suffix(".tmp")
-            async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
-                await f.write(json.dumps(data, ensure_ascii=False, indent=2))
-            tmp.replace(DATA_FILE)
-        except Exception as e:
-            logger.warning(f"Could not save state: {e}")
-
-stats = {
-    "total_bytes": 0,
-    "total_requests": 0,
-    "total_errors": 0,
-    "start_time": time.time(),
-}
-
-error_logs = deque(maxlen=50)
-activity_logs = deque(maxlen=200)
-hourly_traffic = defaultdict(int)
-http_client: httpx.AsyncClient | None = None
-
 SESSION_COOKIE = "x4g_session"
 SESSION_TTL = 60 * 60 * 24 * 7
 
@@ -106,40 +76,45 @@ def is_ip_allowed(ip: str) -> bool:
 
 @app.on_event("startup")
 async def startup_event():
-    global http_client
-    http_client = httpx.AsyncClient(timeout=10.0)
     await load_state()
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    if http_client:
-        await http_client.aclose()
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "X4G Gateway"}
+    return RedirectResponse(url="/login")
 
-# --- روت‌های ورود و صفحه لاگین ---
+# --- صفحه ورود (Login) ---
+LOGIN_HTML = """
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>X4G Gateway - ورود</title>
+    <style>
+        body { background: #0f172a; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .card { background: #1e293b; padding: 2.5rem; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); width: 90%; max-width: 380px; text-align: center; border: 1px solid #334155; }
+        h2 { margin-bottom: 1.5rem; color: #38bdf8; font-size: 1.5rem; }
+        input { width: 100%; padding: 12px 15px; border: 1px solid #334155; border-radius: 8px; background: #0f172a; color: #fff; margin-bottom: 1.2rem; box-sizing: border-box; font-size: 1rem; outline: none; }
+        input:focus { border-color: #38bdf8; }
+        button { width: 100%; padding: 12px; border: none; border-radius: 8px; background: #0284c7; color: #fff; font-size: 1rem; font-weight: bold; cursor: pointer; transition: 0.2s; }
+        button:hover { background: #0369a1; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>🚀 X4G Gateway</h2>
+        <form action="/login" method="post">
+            <input type="password" name="password" placeholder="رمز عبور پنل" required>
+            <button type="submit">ورود به پنل</button>
+        </form>
+    </div>
+</body>
+</html>
+"""
 
 @app.get("/login", response_class=HTMLResponse)
-async def login_page(request: Request):
-    try:
-        from pages import get_login_html
-        return get_login_html()
-    except Exception:
-        return HTMLResponse("""
-        <!DOCTYPE html>
-        <html>
-        <head><title>X4G Gateway - Login</title></head>
-        <body style="background:#111;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;">
-            <form action="/login" method="post" style="background:#222;padding:20px;border-radius:8px;">
-                <h2>X4G Gateway Login</h2>
-                <input type="password" name="password" placeholder="Password" required style="padding:10px;width:100%;box-sizing:border-box;margin-bottom:10px;"><br>
-                <button type="submit" style="padding:10px 20px;width:100%;cursor:pointer;">Login</button>
-            </form>
-        </body>
-        </html>
-        """)
+async def login_page():
+    return HTMLResponse(LOGIN_HTML)
 
 @app.post("/login")
 async def handle_login(request: Request):
@@ -151,7 +126,7 @@ async def handle_login(request: Request):
         response = RedirectResponse(url="/dashboard", status_code=303)
         response.set_cookie(key=SESSION_COOKIE, value=session_id, httponly=True)
         return response
-    return HTMLResponse("<p style='color:red;'>رمز عبور اشتباه است! <a href='/login'>تلاش مجدد</a></p>", status_code=400)
+    return HTMLResponse("<div style='text-align:center;padding:50px;color:#f87171;font-family:sans-serif;'><h3>رمز عبور اشتباه است!</h3><a href='/login' style='color:#38bdf8;'>تلاش مجدد</a></div>", status_code=400)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
@@ -159,11 +134,25 @@ async def dashboard_page(request: Request):
     if not session_id or session_id not in SESSIONS or SESSIONS[session_id] < time.time():
         return RedirectResponse(url="/login")
     
-    try:
-        from pages import get_dashboard_html
-        return get_dashboard_html()
-    except Exception:
-        return HTMLResponse("<h1>خوش آمدید به داشبورد X4G Gateway</h1>")
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html lang="fa" dir="rtl">
+    <head>
+        <meta charset="UTF-8">
+        <title>داشبورد X4G Gateway</title>
+        <style>
+            body { background: #0f172a; color: #fff; font-family: sans-serif; padding: 2rem; }
+            .box { background: #1e293b; padding: 2rem; border-radius: 12px; border: 1px solid #334155; }
+        </style>
+    </head>
+    <body>
+        <div class="box">
+            <h1>سلام! به پنل مدیریت X4G Gateway خوش آمدید 🚀</h1>
+            <p>سرویس شما با موفقیت و بدون ارور در حال اجراست.</p>
+        </div>
+    </body>
+    </html>
+    """)
 
 @app.websocket("/relay")
 async def websocket_relay(websocket: WebSocket, target_host: str = "127.0.0.1", target_port: int = 80):
