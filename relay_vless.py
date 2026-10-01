@@ -5,7 +5,6 @@ from fastapi import WebSocket, WebSocketDisconnect
 logger = logging.getLogger("X4G-Gateway")
 
 async def handle_relay_vless(websocket: WebSocket, target_host: str, target_port: int):
-    # حل مشکل Circular Import با امپورت محلی در زمان اجرا
     try:
         from main import is_ip_allowed
         client_ip = websocket.client.host if websocket.client else "unknown"
