@@ -91,19 +91,6 @@ error_logs = deque(maxlen=50)
 activity_logs = deque(maxlen=200)
 hourly_traffic = defaultdict(int)
 http_client: httpx.AsyncClient | None = None
-LINKS_LOCK = asyncio.Lock()
-SUBS_LOCK = asyncio.Lock()
-
-PROTOCOLS = ["vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one"]
-DEFAULT_PROTOCOL = "vless-ws"
-
-def log_activity(kind: str, message: str, level: str = "info"):
-    activity_logs.append({
-        "kind": kind,
-        "level": level,
-        "message": message,
-        "time": datetime.now().isoformat(),
-    })
 
 SESSION_COOKIE = "x4g_session"
 SESSION_TTL = 60 * 60 * 24 * 7
@@ -131,6 +118,52 @@ async def shutdown_event():
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "X4G Gateway"}
+
+# --- روت‌های ورود و صفحه لاگین ---
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    try:
+        from pages import get_login_html
+        return get_login_html()
+    except Exception:
+        return HTMLResponse("""
+        <!DOCTYPE html>
+        <html>
+        <head><title>X4G Gateway - Login</title></head>
+        <body style="background:#111;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;">
+            <form action="/login" method="post" style="background:#222;padding:20px;border-radius:8px;">
+                <h2>X4G Gateway Login</h2>
+                <input type="password" name="password" placeholder="Password" required style="padding:10px;width:100%;box-sizing:border-box;margin-bottom:10px;"><br>
+                <button type="submit" style="padding:10px 20px;width:100%;cursor:pointer;">Login</button>
+            </form>
+        </body>
+        </html>
+        """)
+
+@app.post("/login")
+async def handle_login(request: Request):
+    form = await request.form()
+    password = form.get("password", "")
+    if hash_password(password) == AUTH.get("password_hash"):
+        session_id = secrets.token_hex(16)
+        SESSIONS[session_id] = time.time() + SESSION_TTL
+        response = RedirectResponse(url="/dashboard", status_code=303)
+        response.set_cookie(key=SESSION_COOKIE, value=session_id, httponly=True)
+        return response
+    return HTMLResponse("<p style='color:red;'>رمز عبور اشتباه است! <a href='/login'>تلاش مجدد</a></p>", status_code=400)
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_page(request: Request):
+    session_id = request.cookies.get(SESSION_COOKIE)
+    if not session_id or session_id not in SESSIONS or SESSIONS[session_id] < time.time():
+        return RedirectResponse(url="/login")
+    
+    try:
+        from pages import get_dashboard_html
+        return get_dashboard_html()
+    except Exception:
+        return HTMLResponse("<h1>خوش آمدید به داشبورد X4G Gateway</h1>")
 
 @app.websocket("/relay")
 async def websocket_relay(websocket: WebSocket, target_host: str = "127.0.0.1", target_port: int = 80):
